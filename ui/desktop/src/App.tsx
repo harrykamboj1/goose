@@ -347,10 +347,14 @@ const ExtensionsRoute = () => {
   );
 };
 
+const NOSTR_IMPORT_SUCCESS_DEDUP_MS = 5000;
+
 export function AppInner() {
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [isLoadingSharedSession, setIsLoadingSharedSession] = useState(false);
   const [sharedSessionError, setSharedSessionError] = useState<string | null>(null);
+  const nostrImportInFlight = useRef<string | null>(null);
+  const recentSuccessfulNostrImports = useRef<Map<string, number>>(new Map());
 
   const navigate = useNavigate();
   const setView = useNavigation();
@@ -440,17 +444,52 @@ export function AppInner() {
   }, []);
 
   useEffect(() => {
+    const shouldSkipNostrDeepLinkImport = (link: string): boolean => {
+      if (nostrImportInFlight.current === link) {
+        return true;
+      }
+      const importedAt = recentSuccessfulNostrImports.current.get(link);
+      return importedAt !== undefined && Date.now() - importedAt < NOSTR_IMPORT_SUCCESS_DEDUP_MS;
+    };
+
     const handleOpenSharedSession = async (_event: IpcRendererEvent, ...args: unknown[]) => {
       const link = args[0] as string;
       window.electron.logInfo(`Opening shared session from deep link ${link}`);
+
+      if (link.startsWith('goose://sessions/nostr')) {
+        if (shouldSkipNostrDeepLinkImport(link)) {
+          window.electron.logInfo('Skipping duplicate Nostr deep link import');
+          return;
+        }
+
+        nostrImportInFlight.current = link;
+        setIsLoadingSharedSession(true);
+        setSharedSessionError(null);
+        try {
+          await importNostrSessionFromDeepLink(link);
+          recentSuccessfulNostrImports.current.set(link, Date.now());
+          navigate('/sessions');
+        } catch (error) {
+          console.error('Unexpected error opening shared session:', error);
+          trackErrorWithContext(error, {
+            component: 'AppInner',
+            action: 'open_shared_session',
+            recoverable: true,
+          });
+          toast.error(`Failed to import Nostr session: ${errorMessage(error, 'Unknown error')}`);
+          navigate('/sessions');
+        } finally {
+          if (nostrImportInFlight.current === link) {
+            nostrImportInFlight.current = null;
+          }
+          setIsLoadingSharedSession(false);
+        }
+        return;
+      }
+
       setIsLoadingSharedSession(true);
       setSharedSessionError(null);
       try {
-        if (link.startsWith('goose://sessions/nostr')) {
-          await importNostrSessionFromDeepLink(link);
-          navigate('/sessions');
-          return;
-        }
         await openSharedSessionFromDeepLink(link, (_view: View, options?: ViewOptions) => {
           navigate('/shared-session', { state: options });
         });
@@ -461,18 +500,13 @@ export function AppInner() {
           action: 'open_shared_session',
           recoverable: true,
         });
-        if (link.startsWith('goose://sessions/nostr')) {
-          toast.error(`Failed to import Nostr session: ${errorMessage(error, 'Unknown error')}`);
-          navigate('/sessions');
-        } else {
-          const shareToken = link.replace('goose://sessions/', '');
-          const options = {
-            sessionDetails: null,
-            error: errorMessage(error, 'Unknown error'),
-            shareToken,
-          };
-          navigate('/shared-session', { state: options });
-        }
+        const shareToken = link.replace('goose://sessions/', '');
+        const options = {
+          sessionDetails: null,
+          error: errorMessage(error, 'Unknown error'),
+          shareToken,
+        };
+        navigate('/shared-session', { state: options });
       } finally {
         setIsLoadingSharedSession(false);
       }
