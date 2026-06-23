@@ -2,8 +2,10 @@ import type {
   ForkSessionRequest,
   ListSessionsRequest,
   LoadSessionResponse,
+  NewSessionRequest,
   SessionInfo,
 } from '@agentclientprotocol/sdk';
+import type { GooseExtension } from '@aaif/goose-sdk';
 import { getAcpClient } from './acpConnection';
 import { DEFAULT_CHAT_TITLE } from '../contexts/ChatContext';
 import type { ExtensionLoadResult, Recipe, Session } from '../api';
@@ -56,14 +58,18 @@ export interface AcpLoadSessionResult {
 
 const inFlightSessionLoads = new Map<string, Promise<AcpLoadSessionResult>>();
 
-export function parseLoadMeta(response: LoadSessionResponse): LoadSessionMeta {
-  const meta = (response._meta ?? {}) as LoadSessionMeta;
+function parseSessionResponseMeta(rawMeta: unknown): LoadSessionMeta {
+  const meta = (rawMeta ?? {}) as LoadSessionMeta;
   return {
     recipe: meta.recipe,
     userRecipeValues: meta.userRecipeValues,
     extensionResults: meta.extensionResults,
     workingDir: typeof meta.workingDir === 'string' ? meta.workingDir : undefined,
   };
+}
+
+export function parseLoadMeta(response: LoadSessionResponse): LoadSessionMeta {
+  return parseSessionResponseMeta(response._meta);
 }
 
 function sessionInfoMeta(s: SessionInfo): GooseSessionInfoMeta {
@@ -194,6 +200,44 @@ async function loadAcpSession(sessionId: string): Promise<AcpLoadSessionResult> 
     sessionInfo: sessionInfoResponse.session,
     response,
     meta: parseLoadMeta(response),
+  };
+}
+
+export interface AcpNewSessionResult {
+  sessionId: string;
+  sessionInfo: SessionInfo;
+  meta: LoadSessionMeta;
+}
+
+export interface AcpRecipeOptions {
+  recipeId?: string;
+  recipeDeeplink?: string;
+}
+
+export async function acpNewSession(
+  cwd: string,
+  gooseExtensions: GooseExtension[],
+  recipe?: AcpRecipeOptions
+): Promise<AcpNewSessionResult> {
+  const client = await getAcpClient();
+  const meta: Record<string, unknown> = { client: 'goose-desktop' };
+  if (gooseExtensions.length > 0) {
+    meta.enabledExtensions = gooseExtensions;
+  }
+  if (recipe?.recipeId) {
+    meta.recipeId = recipe.recipeId;
+  } else if (recipe?.recipeDeeplink) {
+    meta.recipeDeeplink = recipe.recipeDeeplink;
+  }
+  const request: NewSessionRequest = { cwd, mcpServers: [], _meta: meta };
+  const response = await client.newSession(request);
+  const sessionId = String(response.sessionId);
+  const sessionInfoResponse = await client.goose.sessionInfo_unstable({ sessionId });
+
+  return {
+    sessionId,
+    sessionInfo: sessionInfoResponse.session,
+    meta: parseSessionResponseMeta(response._meta),
   };
 }
 

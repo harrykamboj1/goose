@@ -4,7 +4,7 @@ use crate::acp::fs::AcpTools;
 pub(super) use crate::acp::response_builder::{
     build_config_options, build_mode_state, build_model_state, build_provider_options,
     build_session_info, build_session_setup_config, send_session_setup_notifications, session_meta,
-    session_provider_selection, should_refresh_inventory_for_session_init,
+    session_provider_selection, session_response_meta, should_refresh_inventory_for_session_init,
 };
 use crate::acp::tools::AcpAwareToolMeta;
 use crate::acp::{PermissionDecision, ACP_CURRENT_MODEL};
@@ -79,6 +79,8 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
+mod agent_requests;
+pub use agent_requests::agent_request_schemas;
 mod config;
 mod custom_dispatch;
 mod dictation;
@@ -92,6 +94,7 @@ mod manage_sessions;
 mod new_session;
 mod onboarding;
 mod providers;
+mod recipe;
 mod resources;
 mod sources;
 mod tool_notifications;
@@ -211,6 +214,7 @@ pub struct GooseAcpAgent {
     client_mcp_host_info: OnceCell<GooseMcpHostInfo>,
     client_supports_acp_elicitation: OnceCell<bool>,
     client_supports_goose_custom_notifications: OnceCell<bool>,
+    client_supports_recipe_param_requests: OnceCell<bool>,
     use_login_shell_path: OnceCell<bool>,
     client_cx: OnceCell<ConnectionTo<Client>>,
     config_dir: std::path::PathBuf,
@@ -219,6 +223,7 @@ pub struct GooseAcpAgent {
     disable_session_naming: bool,
     provider_inventory: ProviderInventoryService,
     additional_source_roots: Vec<SourceRoot>,
+    recipe_path_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 /// Shorten a session/thread id for perf log correlation.
@@ -300,6 +305,8 @@ struct GooseClientCapabilities {
     mcp_host_capabilities: Option<GooseMcpHostCapabilities>,
     #[serde(rename = "customNotifications", default)]
     custom_notifications: Option<bool>,
+    #[serde(rename = "recipeParameterRequests", default)]
+    recipe_parameter_requests: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -855,6 +862,13 @@ impl GooseAcpAgent {
             .unwrap_or(false)
     }
 
+    pub(super) fn supports_recipe_param_requests(&self) -> bool {
+        self.client_supports_recipe_param_requests
+            .get()
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn supports_acp_elicitation(&self) -> bool {
         self.client_supports_acp_elicitation
             .get()
@@ -896,6 +910,7 @@ impl GooseAcpAgent {
             client_mcp_host_info: OnceCell::new(),
             client_supports_acp_elicitation: OnceCell::new(),
             client_supports_goose_custom_notifications: OnceCell::new(),
+            client_supports_recipe_param_requests: OnceCell::new(),
             use_login_shell_path: OnceCell::new(),
             client_cx: OnceCell::new(),
             config_dir: options.config_dir,
@@ -904,6 +919,7 @@ impl GooseAcpAgent {
             disable_session_naming: options.disable_session_naming,
             provider_inventory,
             additional_source_roots: options.additional_source_roots,
+            recipe_path_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -985,13 +1001,23 @@ impl GooseAcpAgent {
         &self,
         config: &Config,
         mcp_servers: Vec<McpServer>,
+        goose_extensions: Option<Vec<GooseExtension>>,
+        recipe_extensions: Option<&[ExtensionConfig]>,
     ) -> Result<Vec<ExtensionConfig>, agent_client_protocol::Error> {
         let mut extensions = Vec::new();
         for builtin in &self.builtins {
             push_or_replace_extension(&mut extensions, builtin_to_extension_config(builtin));
         }
 
-        if mcp_servers.is_empty() {
+        if let Some(recipe_extensions) = recipe_extensions {
+            for extension in recipe_extensions {
+                push_or_replace_extension(&mut extensions, extension.clone());
+            }
+        } else if let Some(goose_extensions) = goose_extensions {
+            for extension in extensions::goose_extensions_to_configs(goose_extensions)? {
+                push_or_replace_extension(&mut extensions, extension);
+            }
+        } else if mcp_servers.is_empty() {
             for extension in get_enabled_extensions_with_config(config) {
                 push_or_replace_extension(&mut extensions, extension);
             }
@@ -1113,7 +1139,7 @@ impl GooseAcpAgent {
             || EnabledExtensionsState::from_extension_data(&session.extension_data).is_none()
         {
             let extension_data =
-                self.build_enabled_extensions_data(config, &session, mcp_servers)?;
+                self.build_enabled_extensions_data(config, &session, mcp_servers, None, None)?;
             builder = builder.extension_data(extension_data);
             session_needs_update = true;
         }
@@ -1142,8 +1168,15 @@ impl GooseAcpAgent {
         config: &Config,
         session: &Session,
         mcp_servers: Vec<McpServer>,
+        goose_extensions: Option<Vec<GooseExtension>>,
+        recipe_extensions: Option<&[ExtensionConfig]>,
     ) -> Result<ExtensionData, agent_client_protocol::Error> {
-        let extensions = self.initial_session_extensions(config, mcp_servers)?;
+        let extensions = self.initial_session_extensions(
+            config,
+            mcp_servers,
+            goose_extensions,
+            recipe_extensions,
+        )?;
         let mut extension_data = session.extension_data.clone();
         EnabledExtensionsState::new(extensions)
             .to_extension_data(&mut extension_data)
@@ -1879,6 +1912,14 @@ fn extract_client_supports_goose_custom_notifications(
         .unwrap_or(false)
 }
 
+fn extract_client_supports_recipe_param_requests(
+    goose_client_capabilities: Option<&GooseClientCapabilities>,
+) -> bool {
+    goose_client_capabilities
+        .and_then(|goose| goose.recipe_parameter_requests)
+        .unwrap_or(false)
+}
+
 fn outcome_to_confirmation(outcome: &RequestPermissionOutcome) -> PermissionConfirmation {
     PermissionConfirmation {
         principal_type: PrincipalType::Tool,
@@ -2095,6 +2136,9 @@ impl GooseAcpAgent {
         let _ = self.client_supports_goose_custom_notifications.set(
             extract_client_supports_goose_custom_notifications(goose_client_capabilities.as_ref()),
         );
+        let _ = self.client_supports_recipe_param_requests.set(
+            extract_client_supports_recipe_param_requests(goose_client_capabilities.as_ref()),
+        );
         let _ = self
             .client_supports_acp_elicitation
             .set(elicitation::client_supports_form_elicitation(&args));
@@ -2308,43 +2352,6 @@ impl GooseAcpAgent {
             session_id.clone(),
             SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(meta)),
         ))
-    }
-
-    #[allow(dead_code)]
-    async fn add_mcp_extensions(
-        agent: &Arc<Agent>,
-        mcp_servers: Vec<McpServer>,
-        session_id: &str,
-    ) -> Result<(), agent_client_protocol::Error> {
-        let mut configs = Vec::with_capacity(mcp_servers.len());
-        for mcp_server in mcp_servers {
-            let config = match mcp_server_to_extension_config(mcp_server) {
-                Ok(c) => c,
-                Err(msg) => {
-                    return Err(agent_client_protocol::Error::invalid_params().data(msg));
-                }
-            };
-            configs.push(config);
-        }
-
-        if configs.is_empty() {
-            return Ok(());
-        }
-
-        let results = agent
-            .add_extensions_bulk(configs, session_id)
-            .await
-            .internal_err()?;
-        for result in &results {
-            if !result.success {
-                let error_msg = result.error.as_deref().unwrap_or("unknown error");
-                return Err(agent_client_protocol::Error::internal_error().data(format!(
-                    "Failed to add MCP server '{}': {}",
-                    result.name, error_msg
-                )));
-            }
-        }
-        Ok(())
     }
 
     async fn on_load_session(
