@@ -494,6 +494,13 @@ if (process.platform !== 'darwin') {
 
 const pendingDeepLinks = new Map<number, string>();
 
+function queuePendingDeepLink(windowId: number, url: string): void {
+  if (pendingDeepLinks.get(windowId) === url) {
+    return;
+  }
+  pendingDeepLinks.set(windowId, url);
+}
+
 const DEEPLINK_BURST_DEDUP_MS = 2000;
 let lastSentSessionDeepLink: { url: string; at: number } | null = null;
 
@@ -523,9 +530,7 @@ function deliverExtensionOrSessionDeepLink(
   targetWindow: BrowserWindow
 ): void {
   if (targetWindow.webContents.isLoadingMainFrame()) {
-    if (!pendingDeepLinks.has(targetWindow.id)) {
-      pendingDeepLinks.set(targetWindow.id, url);
-    }
+    queuePendingDeepLink(targetWindow.id, url);
     return;
   }
 
@@ -594,9 +599,7 @@ async function handleProtocolUrl(url: string, parsedUrl: URL) {
     }
 
     if (targetWindow.webContents.isLoadingMainFrame()) {
-      if (!pendingDeepLinks.has(targetWindow.id)) {
-        pendingDeepLinks.set(targetWindow.id, url);
-      }
+      queuePendingDeepLink(targetWindow.id, url);
     } else {
       await processProtocolUrl(url, parsedUrl, targetWindow);
     }
@@ -691,9 +694,7 @@ app.on('open-url', async (_event, url) => {
     } else {
       openUrlHandledLaunch = true;
       const newWindow = await createChat(app, { dir: openDir || undefined });
-      if (!pendingDeepLinks.has(newWindow.id)) {
-        pendingDeepLinks.set(newWindow.id, url);
-      }
+      queuePendingDeepLink(newWindow.id, url);
     }
   }
 });
