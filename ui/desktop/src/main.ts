@@ -502,13 +502,27 @@ function queuePendingDeepLink(windowId: number, url: string): void {
 }
 
 const DEEPLINK_BURST_DEDUP_MS = 2000;
-let lastSentSessionDeepLink: { url: string; at: number } | null = null;
+const recentSessionDeepLinkSends = new Map<string, number>();
+
+function pruneExpiredSessionDeepLinkSends(now: number): void {
+  for (const [url, sentAt] of recentSessionDeepLinkSends) {
+    if (now - sentAt >= DEEPLINK_BURST_DEDUP_MS) {
+      recentSessionDeepLinkSends.delete(url);
+    }
+  }
+}
 
 function isBurstDuplicateSessionDeepLink(url: string): boolean {
-  if (!lastSentSessionDeepLink || lastSentSessionDeepLink.url !== url) {
-    return false;
-  }
-  return Date.now() - lastSentSessionDeepLink.at < DEEPLINK_BURST_DEDUP_MS;
+  const now = Date.now();
+  pruneExpiredSessionDeepLinkSends(now);
+  const sentAt = recentSessionDeepLinkSends.get(url);
+  return sentAt !== undefined && now - sentAt < DEEPLINK_BURST_DEDUP_MS;
+}
+
+function recordSessionDeepLinkSend(url: string): void {
+  const now = Date.now();
+  recentSessionDeepLinkSends.set(url, now);
+  pruneExpiredSessionDeepLinkSends(now);
 }
 
 function sendOpenSharedSession(
@@ -520,7 +534,7 @@ function sendOpenSharedSession(
     log.info('[Main] Ignoring burst duplicate session deep link');
     return;
   }
-  lastSentSessionDeepLink = { url, at: Date.now() };
+  recordSessionDeepLinkSend(url);
   window.webContents.send('open-shared-session', url);
 }
 
