@@ -496,6 +496,8 @@ function queuePendingDeepLink(windowId: number, url: string): void {
   pendingDeepLinks.set(windowId, url);
 }
 
+const reactReadyWindows = new Set<number>();
+
 const DEEPLINK_BURST_DEDUP_MS = 2000;
 const recentSessionDeepLinkSends = new Map<string, number>();
 
@@ -520,12 +522,8 @@ function recordSessionDeepLinkSend(url: string): void {
   pruneExpiredSessionDeepLinkSends(now);
 }
 
-function sendOpenSharedSession(
-  window: BrowserWindow,
-  url: string,
-  options?: { skipBurstDedup?: boolean }
-): void {
-  if (!options?.skipBurstDedup && isBurstDuplicateSessionDeepLink(url)) {
+function sendOpenSharedSession(window: BrowserWindow, url: string): void {
+  if (isBurstDuplicateSessionDeepLink(url)) {
     log.info('[Main] Ignoring burst duplicate session deep link');
     return;
   }
@@ -538,7 +536,7 @@ function deliverExtensionOrSessionDeepLink(
   parsedUrl: URL,
   targetWindow: BrowserWindow
 ): void {
-  if (targetWindow.webContents.isLoadingMainFrame()) {
+  if (!reactReadyWindows.has(targetWindow.id) || targetWindow.webContents.isLoadingMainFrame()) {
     queuePendingDeepLink(targetWindow.id, url);
     return;
   }
@@ -1334,6 +1332,7 @@ const createChat = async (app: App, options: CreateChatOptions = {}) => {
 
     pendingInitialMessages.delete(windowId);
     pendingDeepLinks.delete(windowId);
+    reactReadyWindows.delete(windowId);
 
     if (windowPowerSaveBlockers.has(windowId)) {
       const blockerId = windowPowerSaveBlockers.get(windowId)!;
@@ -1409,6 +1408,7 @@ const createLauncher = () => {
   activeLauncherWindow = launcherWindow;
 
   launcherWindow.on('closed', () => {
+    reactReadyWindows.delete(launcherWindow.id);
     activeLauncherWindow = null;
   });
 
@@ -1693,6 +1693,10 @@ ipcMain.on('react-ready', (event) => {
   const window = BrowserWindow.fromWebContents(event.sender);
   const windowId = window?.id;
 
+  if (windowId !== undefined) {
+    reactReadyWindows.add(windowId);
+  }
+
   // Send any pending initial message for this window
   if (windowId && pendingInitialMessages.has(windowId)) {
     const initialMessage = pendingInitialMessages.get(windowId)!;
@@ -1712,7 +1716,7 @@ ipcMain.on('react-ready', (event) => {
       if (parsedUrl.hostname === 'extension') {
         window.webContents.send('add-extension', deepLinkUrl);
       } else if (parsedUrl.hostname === 'sessions') {
-        sendOpenSharedSession(window, deepLinkUrl, { skipBurstDedup: true });
+        sendOpenSharedSession(window, deepLinkUrl);
       }
     } catch (error) {
       log.error('Error processing pending deep link:', error);
